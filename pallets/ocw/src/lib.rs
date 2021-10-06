@@ -49,7 +49,12 @@ pub mod pallet {
 
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
 	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
-	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
+	// coincap不稳定，找个其他的api
+	const HTTP_COINCAP_URL: &str = "https://api.coincap.io/v2/assets/polkadot";
+	// 币安的比较稳定，返回的数据也简单
+	// const HTTP_BINANCE_URL: &str = "https://api3.binance.com/api/v3/avgPrice?symbol=DOTUSDT";
+
+	const HTTP_HEADER_USER_AGENT: &str = "x2x4";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -110,6 +115,18 @@ pub mod pallet {
 	#[derive(Debug, Deserialize, Encode, Decode, Default)]
 	struct IndexingData(Vec<u8>, u64);
 
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct CoinCapData {
+		#[serde(deserialize_with = "de_string_to_bytes")]
+		priceUsd: Vec<u8>
+	}
+
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct PriceInfo {
+		data: CoinCapData,
+		timestamp: u64
+	}
+
 	pub fn de_string_to_bytes<'de, D>(de: D) -> Result<Vec<u8>, D::Error>
 	where
 	D: Deserializer<'de>,
@@ -162,6 +179,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		UpdatePrice(Option<T::AccountId>, u64, Permill),
 	}
 
 	// Errors inform users that something went wrong.
@@ -182,6 +200,9 @@ pub mod pallet {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+
+		//  Json Decode Error
+		JsonDecodeError,
 	}
 
 	#[pallet::hooks]
@@ -241,6 +262,7 @@ pub mod pallet {
 
 			match call {
 				Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
+				Call::submit_price_unsigned(_a,_b) => valid_tx(b"submit_price_unsigned".to_vec()),
 				Call::submit_number_unsigned_with_signed_payload(ref payload, ref signature) => {
 					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
 						return InvalidTransaction::BadProof.into();
@@ -288,6 +310,15 @@ pub mod pallet {
 			Self::deposit_event(Event::NewNumber(None, number));
 			Ok(())
 		}
+
+		#[pallet::weight(10000)]
+		pub fn submit_price_unsigned(origin: OriginFor<T>, a: u64, b: Permill) -> DispatchResult {
+			let _ = ensure_none(origin)?;
+			log::info!("submit_price_unsigned: {:0?}.{:1?}", a, b);
+			Self::append_or_replace_price(a, b);
+			Self::deposit_event(Event::UpdatePrice(None, a, b));
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -303,6 +334,21 @@ pub mod pallet {
 			});
 		}
 
+
+		fn append_or_replace_price(a: u64, b: Permill) {
+			Prices::<T>::mutate(|prices| {
+				if prices.len() == NUM_VEC_LEN {
+					let pop_price = prices.pop_front();
+					match pop_price {
+						Some(i) => log::info!("pop_price: {:0?}.{:1?}", i.0, i.1),
+						None => {}
+					}
+				}
+				prices.push_back((a, b));
+				log::info!("Prices vector: {:?}", prices);
+			});
+		}
+
 		fn fetch_price_info() -> Result<(), Error<T>> {
 			// TODO: 这是你们的功课
 
@@ -315,6 +361,33 @@ pub mod pallet {
 
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
+
+
+			// 根据查到的文档，Permill::from_float(f64) 来获取小数部分 (这个只能再test用)
+            // 获取到的字符串可以通过下面的办法转成f64
+			// let xyz = "66.33";
+			// let fxy = xyz.parse::<f64>().unwrap();
+			// let uxy = fxy.round() as u64;
+			// println!("{:?}", fxy);
+			let (a, b) = Self::fetch_dot_parse().unwrap();
+			log::info!("u64: {:0?}, Permill: {:1?}", a, b);
+			// 这里直接用不具签名交易，理由是这个只是用于同步链下与链上某个状态的Oracle，并不需要证明这是谁
+			// 如果从安全角度考虑，还是要加上签名，这样信息的写入可以被追溯，这里简化就直接不签名了
+			// call example
+			// let call = Call::submit_number_unsigned(number);
+			//
+			// 			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
+			// 			.map_err(|_| {
+			// 				log::error!("Failed in offchain_unsigned_tx");
+			// 				<Error<T>>::OffchainUnsignedTxError
+			// 			})
+			let call = Call::submit_price_unsigned(a, b);
+
+			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
+				.map_err(|_| {
+					log::error!("Failed in offchain_unsigned_tx");
+					<Error<T>>::OffchainUnsignedTxError
+				});
 
 			Ok(())
 		}
@@ -368,9 +441,34 @@ pub mod pallet {
 			Ok(())
 		}
 
+		fn fetch_dot_parse() -> Result<(u64, Permill), Error<T>> {
+			let resp_bytes = Self::fetch_from_remote(HTTP_COINCAP_URL).map_err(|e| {
+				log::error!("fetch_from_remote error: {:?}", e);
+				<Error<T>>::HttpFetchingError
+			})?;
+			let resp_str = str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			// log::info!("resp: {}", resp_str);
+
+			let price_info: PriceInfo = serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::JsonDecodeError)?;
+
+			// log::info!("price: {:?}", price_info);
+			// 已经可以获取到了价格，然后需要拆下字符串
+			let price_str = str::from_utf8(&price_info.data.priceUsd).unwrap();
+			let price_vec = price_str.split(".").collect::<Vec<&str>>();
+			log::info!("{:?}", price_vec);
+			let price_u64 = price_vec[0].parse::<u64>().unwrap();
+			let price_a = price_vec[1].as_bytes().to_vec()[0..6].to_vec();
+			let price_b = str::from_utf8(&price_a).unwrap();
+			log::info!("price_b: {}", &price_b);
+			let price_decimal = price_b.parse::<u32>().unwrap();
+			log::info!("price_decimal: {}", price_decimal);
+			// let price: f64= 33.33;
+			Ok((price_u64, Permill::from_parts(price_decimal)))
+		}
+
 		/// Fetch from remote and deserialize the JSON to a struct
 		fn fetch_n_parse() -> Result<GithubInfo, Error<T>> {
-			let resp_bytes = Self::fetch_from_remote().map_err(|e| {
+			let resp_bytes = Self::fetch_from_remote(HTTP_REMOTE_REQUEST).map_err(|e| {
 				log::error!("fetch_from_remote error: {:?}", e);
 				<Error<T>>::HttpFetchingError
 			})?;
@@ -387,11 +485,12 @@ pub mod pallet {
 
 		/// This function uses the `offchain::http` API to query the remote github information,
 		///   and returns the JSON response as vector of bytes.
-		fn fetch_from_remote() -> Result<Vec<u8>, Error<T>> {
-			log::info!("sending request to: {}", HTTP_REMOTE_REQUEST);
+		/// 传入url
+		fn fetch_from_remote(url: &str) -> Result<Vec<u8>, Error<T>> {
+			log::info!("sending request to: {}", url);
 
 			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
-			let request = rt_offchain::http::Request::get(HTTP_REMOTE_REQUEST);
+			let request = rt_offchain::http::Request::get(url);
 
 			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
 			let timeout = sp_io::offchain::timestamp()
