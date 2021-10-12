@@ -70,6 +70,8 @@ pub fn new_partial(
 	let client = Arc::new(client);
 
 	let keystore = keystore_container.sync_keystore();
+	// 如果offchain worker是打开的（默认是打开的）
+	// 下面就是插入Alice的账户到ocw pallet
 	if config.offchain_worker.enabled {
 		// Initialize seed for signing transaction using off-chain workers. This is a convenience
 		// so learners can see the transactions submitted simply running the node.

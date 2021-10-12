@@ -282,7 +282,8 @@ impl pallet_ocw::Config for Runtime {
 	type Call = Call;
 	type Event = Event;
 }
-
+/// 因为pallet中对于Config增加了一个CreateSignedTransaction trait约束
+/// -------------------------------------------------------------------
 impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Runtime
 where
 	Call: From<LocalCall>,
@@ -324,6 +325,8 @@ impl frame_system::offchain::SigningTypes for Runtime {
 	type Public = <Signature as sp_runtime::traits::Verify>::Signer;
 	type Signature = Signature;
 }
+/// -------------------------------------------------------------------
+
 
 impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
 where
